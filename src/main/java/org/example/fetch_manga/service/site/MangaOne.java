@@ -12,6 +12,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Locale;
 import java.util.concurrent.TimeUnit;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
@@ -19,7 +20,9 @@ import java.util.regex.Pattern;
 /**
  * マンガワン / Manga One (manga-one.com, Shogakukan).
  *
- * <p>Cơ chế (dựng ngược 2026-09-16):</p>
+ * <p>Có hai đường tải; có secret app thì ưu tiên đường app.</p>
+ *
+ * <h3>Đường web (dựng ngược 2026-09-16)</h3>
  * <ol>
  *   <li>URL chương: {@code /manga/<titleId>/chapter/<chapterId>} → tách hai id.</li>
  *   <li><b>POST</b> (GET trả 405) tới
@@ -34,6 +37,23 @@ import java.util.regex.Pattern;
  * <p>⚠ Field 1 (danh sách trang) chỉ có khi request kèm <b>cookie đăng nhập</b> của tài
  * khoản có quyền đọc chương đó; gọi không cookie thì response vẫn có key/iv nhưng không
  * có trang nào. Khoá và tham số {@code hash} đều có hạn nên phải gọi API mỗi lần tải.</p>
+ *
+ * <h3>Đường app iOS (dựng ngược 2026-11-01 từ マンガワン 8.0.70, bundle {@code com.lnu.mgm})</h3>
+ * <ol>
+ *   <li><b>GET</b> {@code https://app.manga-one.com/api/v4/viewer?chapter_id=..&quality=medium
+ *       &secret=..&coin=0&free_life=0&special_life=0&app_ver=..&os_ver=..} — chỉ cần
+ *       chapter_id, không cần title_id. Xác thực bằng {@code secret} (32 ký tự hex, gắn với
+ *       tài khoản đăng nhập trên app), không dùng cookie.</li>
+ *   <li>Response là protobuf; mỗi trang là một URL
+ *       {@code .../secure/<n>/webp/manga_page_high/<chapterId>/<n>.webp?hash=..&expires=..}
+ *       — <b>không mã hoá</b>, 960px (web chỉ có bản 720px). Trang đệm
+ *       {@code new_blank.png} ở đầu và các ô quảng cáo cuối chương không có link nên tự bị bỏ qua.</li>
+ *   <li>Link ảnh có hạn vài ngày và tải thẳng được, không cần secret.</li>
+ * </ol>
+ *
+ * <p>{@code coin} / {@code free_life} / {@code special_life} là số コイン / 無料ライフ /
+ * SPライフ muốn tiêu để mở chương; app gửi 0 khi đọc chương đã mở. Lớp này <b>luôn gửi 0</b>
+ * nên chỉ tải được chương tài khoản đã mở sẵn trên app, không bao giờ tự tiêu vật phẩm.</p>
  */
 public class MangaOne extends Manga {
 
@@ -42,11 +62,42 @@ public class MangaOne extends Manga {
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
                     + "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
 
+    private static final String APP_ORIGIN = "https://app.manga-one.com";
+    // Giữ đúng phiên bản app đã dựng ngược; server có thể từ chối bản quá cũ thì nâng ở đây.
+    private static final String APP_VER = "8.0.70";
+    private static final String APP_OS_VER = "18.7.8";
+    private static final String APP_UA = "MangaONE3_Production/" + APP_VER
+            + " (com.lnu.mgm; build:202610070909; iOS " + APP_OS_VER + ") Alamofire/5.12.0";
+    /** Mức app tự gửi; trả về bản manga_page_high 960px. */
+    private static final String APP_QUALITY = "medium";
+
     /** Cookie tài khoản — bắt buộc với chương đã mua/mở bằng vé. */
     private String cookie = null;
 
     public void setCookie(String cookie) {
         this.cookie = (cookie != null && !cookie.isBlank()) ? cookie.trim() : null;
+    }
+
+    /** Secret của app iOS; có thì tải qua API app thay cho API web. */
+    private String appSecret = null;
+
+    /**
+     * Nhận 32 ký tự hex, hoặc nguyên URL / lệnh cURL bắt được từ app có chứa
+     * {@code secret=...} — tự bóc phần secret ra.
+     */
+    public void setAppSecret(String raw) {
+        if (raw == null || raw.isBlank()) {
+            this.appSecret = null;
+            return;
+        }
+        String s = raw.trim();
+        Matcher m = SECRET_IN_TEXT.matcher(s);
+        if (m.find()) s = m.group(1);
+        if (!HEX32.matcher(s).matches()) {
+            throw new IllegalArgumentException("Secret app phải là 32 ký tự hex, "
+                    + "hoặc dán nguyên URL request của app có chứa secret=...");
+        }
+        this.appSecret = s.toLowerCase(Locale.ROOT);
     }
 
     /** Thư mục lưu tuyệt đối; null thì dùng quy ước basePath của lớp cha. */
@@ -59,70 +110,109 @@ public class MangaOne extends Manga {
     private static final Pattern URL_IDS =
             Pattern.compile("/manga/(\\d+)/(chapter|choitashi)/(\\d+)");
 
+    /** Link chia sẻ từ app: {@code https://manga-one.com/title/<titleId>/<chapterId>?r=..} */
+    private static final Pattern SHARE_IDS =
+            Pattern.compile("/title/(\\d+)/(\\d+)");
+
     /**
-     * Link ảnh đã mã hoá nằm rải trong protobuf; bắt thẳng bằng regex cho chắc.
+     * Link ảnh nằm rải trong protobuf; bắt thẳng bằng regex cho chắc.
      *
      * <p>group(1) = số trang server ghi trong đường dẫn (dùng để sắp xếp và đặt tên).
+     * Web trả {@code .webp.enc} (mã hoá), app trả {@code .webp} thường.
      * Phần query chỉ nhận đúng ký tự hợp lệ của URL — <b>không</b> dùng {@code [^\s"]+}
      * vì protobuf có byte nhị phân xen giữa các link, {@code [^\s"]} sẽ nuốt luôn byte
      * rác lẫn cả link kế tiếp, sinh ra link hỏng làm lệch số thứ tự trang.</p>
      */
-    private static final Pattern ENC_IMAGE =
+    private static final Pattern PAGE_IMAGE =
             Pattern.compile("https://[\\w.-]+/secure/\\d+/webp/(?:manga_page[\\w_]*|choitashi_page)/\\d+/(\\d+)"
-                    + "\\.webp\\.enc\\?[A-Za-z0-9=&%._~+-]+");
+                    + "\\.webp(?:\\.enc)?\\?[A-Za-z0-9=&%._~+-]+");
 
     private static final Pattern HEX64 = Pattern.compile("^[0-9a-fA-F]{64}$");
     private static final Pattern HEX32 = Pattern.compile("^[0-9a-fA-F]{32}$");
+    private static final Pattern SECRET_IN_TEXT = Pattern.compile("secret=([0-9a-fA-F]{32})");
 
     // ── Manga ───────────────────────────────────────────────────────────────
 
+    /** Các id tách được từ link chương. */
+    private static final class ChapterIds {
+        String titleId;
+        String chapterId;
+        boolean choitashi;
+    }
+
+    private static ChapterIds parseIds(String url) {
+        ChapterIds ids = new ChapterIds();
+        Matcher m = URL_IDS.matcher(url);
+        if (m.find()) {
+            ids.titleId = m.group(1);
+            ids.choitashi = "choitashi".equals(m.group(2));
+            ids.chapterId = m.group(3);
+            return ids;
+        }
+        m = SHARE_IDS.matcher(url);
+        if (m.find()) {
+            ids.titleId = m.group(1);
+            ids.chapterId = m.group(2);
+            return ids;
+        }
+        throw new IllegalArgumentException(
+                "URL không đúng dạng https://manga-one.com/manga/<id>/chapter/<id> "
+                        + "(hoặc /choitashi/<id> cho ảnh bonus, /title/<id>/<id> cho link chia sẻ từ app)");
+    }
+
     @Override
     protected String extractChapNumber(String url) {
-        Matcher m = URL_IDS.matcher(url);
-        if (!m.find()) {
-            throw new IllegalArgumentException(
-                    "URL không đúng dạng https://manga-one.com/manga/<id>/chapter/<id> "
-                            + "(hoặc /choitashi/<id> cho ảnh bonus)");
-        }
-        return m.group(3);
+        return parseIds(url).chapterId;
     }
 
     @Override
     protected void parseAndDownload(String url, String chapNumber) throws Exception {
-        Matcher m = URL_IDS.matcher(url);
-        if (!m.find()) {
-            throw new IllegalArgumentException("Không tách được title_id / chapter_id từ URL.");
-        }
-        String titleId = m.group(1);
-        boolean choitashi = "choitashi".equals(m.group(2));
-        String chapterId = m.group(3);
+        ChapterIds ids = parseIds(url);
 
-        String api = choitashi ? "choitashi_viewer" : "viewer_v2";
-        System.out.println("📡 Gọi API " + api + " (title " + titleId + ", "
-                + (choitashi ? "ảnh bonus " : "chapter ") + chapterId + ")...");
-        byte[] proto = callViewerApi(titleId, chapterId, url, choitashi);
+        boolean viaApp = appSecret != null && !ids.choitashi;
+        if (appSecret != null && ids.choitashi) {
+            System.out.println("ℹ Ảnh bonus chưa hỗ trợ qua API app, dùng API web (cần cookie).");
+        }
+
+        byte[] proto;
+        if (viaApp) {
+            System.out.println("📱 Gọi API app iOS viewer (chapter " + ids.chapterId
+                    + ", quality=" + APP_QUALITY + ")...");
+            proto = callAppViewerApi(ids.chapterId);
+        } else {
+            String api = ids.choitashi ? "choitashi_viewer" : "viewer_v2";
+            System.out.println("📡 Gọi API " + api + " (title " + ids.titleId + ", "
+                    + (ids.choitashi ? "ảnh bonus " : "chapter ") + ids.chapterId + ")...");
+            proto = callViewerApi(ids.titleId, ids.chapterId, url, ids.choitashi);
+        }
         System.out.println("📦 Nhận " + proto.length + " byte protobuf");
 
         Viewer viewer = parseViewer(proto);
 
-        if (viewer.key == null || viewer.iv == null) {
-            throw new RuntimeException("Không tìm thấy khoá giải mã trong response.");
-        }
-        System.out.println("🔑 Khoá AES-" + (viewer.key.length * 8) + " + IV " + viewer.iv.length + " byte");
-
         if (viewer.pageUrls.isEmpty()) {
-            throw new RuntimeException(
-                    "Response không có trang nào. Nguyên nhân hầu như luôn là thiếu cookie "
+            throw new RuntimeException(viaApp
+                    ? "Response không có trang nào. Chương này chưa được mở trên app (hết hạn đọc lại, "
+                            + "chưa dùng coin/ライフ), hoặc secret không còn hiệu lực — mở chương trên app trước rồi tải lại."
+                    : "Response không có trang nào. Nguyên nhân hầu như luôn là thiếu cookie "
                             + "hoặc tài khoản chưa mở chương này — hãy dán cookie của phiên đang đọc được.");
         }
-        System.out.println("🖼  " + viewer.pageUrls.size() + " trang");
+
+        boolean encrypted = viewer.pageUrls.get(0).contains(".webp.enc");
+        if (encrypted) {
+            if (viewer.key == null || viewer.iv == null) {
+                throw new RuntimeException("Không tìm thấy khoá giải mã trong response.");
+            }
+            System.out.println("🔑 Khoá AES-" + (viewer.key.length * 8) + " + IV " + viewer.iv.length + " byte");
+        }
+        System.out.println("🖼  " + viewer.pageUrls.size() + " trang"
+                + (encrypted ? "" : " (không mã hoá)"));
 
         Path folder = resolveFolder(chapNumber);
         Files.createDirectories(folder);
         System.out.println("📁 Lưu vào: " + folder);
 
         for (int i = 0; i < viewer.pageUrls.size(); i++) {
-            downloadAndDecrypt(viewer.pageUrls.get(i), folder, i + 1, viewer.key, viewer.iv, url);
+            downloadPage(viewer.pageUrls.get(i), folder, i + 1, viewer, viaApp, url);
         }
 
         executor.shutdown();
@@ -177,6 +267,34 @@ public class MangaOne extends Manga {
         }
     }
 
+    /** API viewer của app iOS: GET, xác thực bằng secret trên query string. */
+    private byte[] callAppViewerApi(String chapterId) throws Exception {
+        String api = APP_ORIGIN + "/api/v4/viewer"
+                + "?app_ver=" + APP_VER
+                + "&chapter_id=" + chapterId
+                + "&coin=0&free_life=0"
+                + "&os_ver=" + APP_OS_VER
+                + "&quality=" + APP_QUALITY
+                + "&secret=" + appSecret
+                + "&special_life=0";
+
+        HttpURLConnection conn = (HttpURLConnection) new URL(api).openConnection();
+        conn.setConnectTimeout(15000);
+        conn.setReadTimeout(30000);
+        conn.setRequestProperty("User-Agent", APP_UA);
+        conn.setRequestProperty("Accept", "*/*");
+        conn.setRequestProperty("Accept-Language", "ja-JP;q=1.0");
+
+        int code = conn.getResponseCode();
+        if (code != HttpURLConnection.HTTP_OK) {
+            throw new RuntimeException("API app trả HTTP " + code
+                    + (code == 401 || code == 403 ? " — secret sai hoặc đã hết hiệu lực." : ""));
+        }
+        try (InputStream in = conn.getInputStream()) {
+            return readAll(in);
+        }
+    }
+
     // ── Đọc protobuf ────────────────────────────────────────────────────────
 
     /** Những gì cần lấy ra từ response. */
@@ -190,7 +308,7 @@ public class MangaOne extends Manga {
      * Quét toàn bộ cây protobuf thay vì bám cứng vào số thứ tự field.
      *
      * <p>Danh sách trang nằm lồng nhiều lớp và cấu trúc có thể đổi theo phiên bản,
-     * nên cách chắc ăn là duyệt hết mọi chuỗi: cái nào là link {@code .webp.enc} thì
+     * nên cách chắc ăn là duyệt hết mọi chuỗi: cái nào là link ảnh trang thì
      * gom lại, cái nào là hex 64/32 ký tự thì nhận làm key/iv.</p>
      *
      * <p>Trang được gom vào map theo <b>số trang trong URL</b> rồi sắp xếp lại, nên
@@ -210,7 +328,7 @@ public class MangaOne extends Manga {
             } else if (v.iv == null && HEX32.matcher(s).matches()) {
                 v.iv = hexToBytes(s);
             }
-            Matcher m = ENC_IMAGE.matcher(s);
+            Matcher m = PAGE_IMAGE.matcher(s);
             while (m.find()) {
                 int pageNo = Integer.parseInt(m.group(1));
                 // Giữ link đầu tiên gặp cho mỗi số trang; bản trùng về sau bỏ qua.
@@ -278,37 +396,53 @@ public class MangaOne extends Manga {
 
     // ── Tải và giải mã ──────────────────────────────────────────────────────
 
-    private void downloadAndDecrypt(String imageUrl, Path folder, int index,
-                                    byte[] key, byte[] iv, String referer) {
+    /**
+     * Tải một trang; link {@code .webp.enc} (web) được giải mã AES, link {@code .webp}
+     * (app) ghi thẳng ra file.
+     */
+    private void downloadPage(String imageUrl, Path folder, int index,
+                              Viewer viewer, boolean viaApp, String referer) {
         futures.add(executor.submit(() -> {
             try {
                 HttpURLConnection conn = (HttpURLConnection) new URL(imageUrl).openConnection();
                 conn.setConnectTimeout(15000);
                 conn.setReadTimeout(30000);
-                conn.setRequestProperty("User-Agent", UA);
-                conn.setRequestProperty("Referer", referer);
-                conn.setRequestProperty("Origin", ORIGIN);
                 conn.setRequestProperty("Accept", "*/*");
-                if (cookie != null) conn.setRequestProperty("Cookie", cookie);
-
-                byte[] encrypted;
-                try (InputStream in = conn.getInputStream()) {
-                    encrypted = readAll(in);
+                if (viaApp) {
+                    conn.setRequestProperty("User-Agent", APP_UA);
+                } else {
+                    conn.setRequestProperty("User-Agent", UA);
+                    conn.setRequestProperty("Referer", referer);
+                    conn.setRequestProperty("Origin", ORIGIN);
+                    if (cookie != null) conn.setRequestProperty("Cookie", cookie);
                 }
 
-                Cipher cipher = Cipher.getInstance("AES/CBC/PKCS5Padding");
-                cipher.init(Cipher.DECRYPT_MODE,
-                        new SecretKeySpec(key, "AES"), new IvParameterSpec(iv));
-                byte[] plain = cipher.doFinal(encrypted);
+                int code = conn.getResponseCode();
+                if (code != HttpURLConnection.HTTP_OK) {
+                    throw new RuntimeException("HTTP " + code);
+                }
 
-                if (!looksLikeWebp(plain)) {
-                    throw new RuntimeException("Giải mã xong nhưng không phải file WebP hợp lệ.");
+                byte[] body;
+                try (InputStream in = conn.getInputStream()) {
+                    body = readAll(in);
+                }
+
+                byte[] image = body;
+                if (imageUrl.contains(".webp.enc")) {
+                    Cipher cipher = Cipher.getInstance("AES/CBC/PKCS5Padding");
+                    cipher.init(Cipher.DECRYPT_MODE,
+                            new SecretKeySpec(viewer.key, "AES"), new IvParameterSpec(viewer.iv));
+                    image = cipher.doFinal(body);
+                }
+
+                if (!looksLikeWebp(image)) {
+                    throw new RuntimeException("Dữ liệu tải về không phải file WebP hợp lệ.");
                 }
 
                 Path out = folder.resolve(String.format("%03d.webp", index));
-                Files.write(out, plain);
+                Files.write(out, image);
                 System.out.println("✔ [" + index + "] " + out.getFileName()
-                        + " (" + plain.length / 1024 + " KB)");
+                        + " (" + image.length / 1024 + " KB)");
 
             } catch (Exception e) {
                 System.err.println("❌ Trang " + index + ": " + e.getMessage());

@@ -51,3 +51,6 @@ tools/app.ico
 /tho_*.txt
 # Scratch test
 /TestRegex.java
+
+# Secret app iOS マンガワン đóng gói kèm bản build — repo public nên TUYỆT ĐỐI không đẩy lên
+/src/main/resources/mangaone-app.properties

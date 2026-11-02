@@ -314,10 +314,48 @@ register(new TrangMoiFetcher());
 
 Mangarawjp · MangaPlus · Comic Days · MangaPill · Comix.to · CuuTruyen ·
 MangaFire (theo link) · MangaFire (nhập Chapter ID) · NicoManga · Shonen Jump+ ·
-Heros-Web / Comici · Sunday Webry · pixiv Comic · Comic Walker / カドコミ
+Heros-Web / Comici · Sunday Webry · pixiv Comic · Comic Walker / カドコミ ·
+Manga One / マンガワン
 
 Với nguồn trả phí, ứng dụng cần cookie của **tài khoản đã mua chương đó** — nó chỉ tải
 về những gì tài khoản của bạn có quyền đọc.
+
+### Manga One qua API app iOS
+
+Nguồn Manga One có ô **Tải từ** để chọn một trong hai đường. Chọn *app iOS* thì ứng dụng gọi
+thẳng API của app マンガワン (`app.manga-one.com/api/v4/viewer`) từ PC — không cần iPhone hay
+proxy nữa:
+
+| | Đường app (có secret) | Đường web (cookie) |
+|---|---|---|
+| Ảnh | 960px, WebP không mã hoá | 720px, phải giải mã AES |
+| Xác thực | `secret` 32 ký tự hex, nhớ lại giữa các lần chạy | Cookie trình duyệt |
+| Link nhận | `/manga/<id>/chapter/<id>` hoặc link chia sẻ từ app `/title/<id>/<id>` | như bên trái |
+
+Chỉ tải được chương **tài khoản đã mở sẵn trên app** (miễn phí, đang trong hạn đọc lại, đã
+dùng coin/ライフ). Ứng dụng luôn gửi `coin=0&free_life=0&special_life=0` nên không bao giờ
+tự tiêu vật phẩm. Ảnh bonus `/choitashi/` vẫn đi đường web.
+
+**Lấy secret (làm một lần):** secret nằm trên mọi request của app nên phải bắt traffic một lần.
+
+1. Mac/PC: `brew install mitmproxy` rồi chạy `mitmdump --listen-host 0.0.0.0 -p 8080`.
+2. iPhone cùng Wi-Fi: Cài đặt → Wi-Fi → (i) → Định cấu hình proxy → Thủ công, máy chủ là IP
+   của PC, cổng `8080`.
+3. Safari mở `http://mitm.it` → tải hồ sơ Apple → Cài đặt → Đã tải về hồ sơ → Cài đặt.
+   Rồi Cài đặt chung → Giới thiệu → Cài đặt tin cậy chứng nhận → bật **mitmproxy**.
+4. Mở app マンガワン, mở một chương bất kỳ. Trong cửa sổ mitmdump, copy một dòng
+   `app.manga-one.com/api/v4/...?...secret=...` và dán nguyên vào ô Secret app iOS.
+5. **Dọn dẹp:** tắt proxy trên iPhone, gỡ hồ sơ mitmproxy (Cài đặt chung → Quản lý VPN &
+   Thiết bị), tắt mitmdump.
+
+Secret là của phiên đăng nhập trên app, nên có thể đổi khi cài lại app hoặc đăng xuất (chưa
+kiểm chứng). Nếu API báo lỗi secret, hoặc chương đã mở trên app mà vẫn không có trang nào, thì
+lấy lại theo các bước trên, xoá secret cũ trong ô và dán secret mới — giá trị mới được nhớ lại.
+
+**Điền sẵn secret vào bản build:** tạo file `src/main/resources/mangaone-app.properties` với
+một dòng `appSecret=<32 ký tự hex>` trước khi chạy `build-exe.ps1`. File được đóng gói vào exe
+và dùng làm giá trị mặc định của ô Secret. File này nằm trong `.gitignore` — repo đang public,
+**đừng** commit nó; clone sang máy khác thì phải tạo lại bằng tay.
 
 ---
 
