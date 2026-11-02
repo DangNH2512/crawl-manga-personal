@@ -1,0 +1,53 @@
+HELP.md
+target/
+.mvn/wrapper/maven-wrapper.jar
+!**/src/main/**/target/
+!**/src/test/**/target/
+
+### STS ###
+.apt_generated
+.classpath
+.factorypath
+.project
+.settings
+.springBeans
+.sts4-cache
+
+### IntelliJ IDEA ###
+.idea
+*.iws
+*.iml
+*.ipr
+
+### NetBeans ###
+/nbproject/private/
+/nbbuild/
+/dist/
+/nbdist/
+/.nb-gradle/
+build/
+!**/src/main/**/build/
+!**/src/test/**/build/
+
+### VS Code ###
+.vscode/
+
+### Ban dong goi exe ###
+dist/
+tools/app.ico
+
+### Rác khi phát triển — KHÔNG đẩy lên ###
+# Ảnh truyện tải về để thử (nội dung có bản quyền, chỉ dùng cục bộ)
+/*.jpg
+/*.jpeg
+/*.png
+/*.webp
+/*.psd
+# Bản dump HTML lưu lại khi dựng ngược scraper
+/*.html
+# File liệt kê thư mục dùng một lần
+/folder_list*.txt
+/himaten_*.txt
+/tho_*.txt
+# Scratch test
+/TestRegex.java
